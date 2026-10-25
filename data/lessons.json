@@ -1,0 +1,26 @@
+[
+  {
+    "title": "Opening principles",
+    "topic": "opening",
+    "difficulty": "beginner",
+    "content": "In the opening, aim to influence the central squares, develop your knights and bishops, and protect your king. Castling often helps king safety and connects your rooks once the other pieces leave the back rank. Avoid moving the same piece repeatedly without a concrete reason. These principles are guidelines: checks, threats, and tactical opportunities can justify exceptions."
+  },
+  {
+    "title": "Ideas behind the Italian Game",
+    "topic": "opening",
+    "difficulty": "beginner",
+    "content": "The Italian Game begins 1. e4 e5 2. Nf3 Nc6 3. Bc4. White develops a bishop toward the centre and places pressure on f7, a square initially defended only by Black's king. Common plans include castling and preparing central play with c3 and d4. The best continuation depends on Black's response. Pressure on f7 does not mean an immediate sacrifice is sound."
+  },
+  {
+    "title": "Understanding a knight fork",
+    "topic": "tactics",
+    "difficulty": "beginner",
+    "content": "A knight fork occurs when a knight attacks two or more opposing pieces at once. A fork involving the enemy king is especially forcing because the check must be answered. Before playing a fork, check whether the knight can be captured legally and whether the opponent has a stronger threat. Knights attack squares of the opposite colour from the square they occupy."
+  },
+  {
+    "title": "Understanding en passant",
+    "topic": "rules",
+    "difficulty": "beginner",
+    "content": "En passant is a special pawn capture. When an opposing pawn moves two squares from its starting square and lands beside your pawn, your pawn may capture it as though it had moved only one square. This capture is available only on your immediately following move. A white pawn must be on its fifth rank, or a black pawn on its fourth rank, to make this capture. For example, with a white pawn on e5, if Black plays d7-d5, White may play e5xd6 en passant, removing the black pawn from d5. The capture must be legal: it cannot leave your own king in check."
+  }
+]
