@@ -9,6 +9,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi import _rate_limit_exceeded_handler
+from typing import Literal
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -68,7 +69,7 @@ def health():
 @app.post("/api/chat", response_model=ChatResponse)
 @limiter.limit("5/minute")
 def chat(request: Request, payload: ChatRequest):
-    question = request.question.strip()
+    question = payload.question.strip()
 
     if not question:
         raise HTTPException(
@@ -167,4 +168,107 @@ def get_games(name: str = "Italian Game"):
         raise HTTPException(
             status_code=503,
             detail="Game search is temporarily unavailable.",
+        ) from None
+
+from analysis_engine import (
+    analyse_position,
+    play_stockfish,
+    EngineBusyError,
+)
+
+
+class AnalysisRequest(BaseModel):
+    fen: str = Field(min_length=1, max_length=200)
+
+
+class AnalysisResponse(BaseModel):
+    fen: str
+    status: str
+    result: str | None
+    best_move_uci: str | None
+    best_move_san: str | None
+    score_cp: int | None
+    mate_in: int | None
+    depth: int | None
+    continuation: list[str]
+
+
+@app.post("/api/analyse", response_model=AnalysisResponse)
+@limiter.limit("5/minute")
+def analyse(request: Request, payload: AnalysisRequest):
+    try:
+        return analyse_position(payload.fen.strip())
+
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide a valid chess position in FEN format.",
+        ) from None
+
+    except EngineBusyError:
+        raise HTTPException(
+            status_code=503,
+            detail="Another analysis is running. Please retry shortly.",
+            headers={"Retry-After": "2"},
+        ) from None
+
+    except Exception as error:
+        print(
+            "Analysis failure:",
+            type(error).__name__,
+            flush=True,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="The analysis engine is temporarily unavailable.",
+        ) from None
+
+class PlayRequest(BaseModel):
+    fen: str = Field(min_length=1, max_length=200)
+    difficulty: Literal["easy", "medium", "hard", "extreme"]
+
+
+class PlayResponse(BaseModel):
+    status: str
+    fen: str
+    move_uci: str | None
+    move_san: str | None
+    game_over: bool
+    result: str | None
+    termination: str | None
+
+
+@app.post("/api/play", response_model=PlayResponse)
+@limiter.limit("10/minute")
+def play(request: Request, payload: PlayRequest):
+    try:
+        return play_stockfish(
+            payload.fen.strip(),
+            payload.difficulty,
+        )
+
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide a valid chess position.",
+        ) from None
+
+    except EngineBusyError:
+        raise HTTPException(
+            status_code=503,
+            detail="Stockfish is busy. Please retry shortly.",
+            headers={"Retry-After": "2"},
+        ) from None
+
+    except Exception as error:
+        print(
+            "Stockfish play failure:",
+            type(error).__name__,
+            flush=True,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Stockfish is temporarily unavailable.",
         ) from None
