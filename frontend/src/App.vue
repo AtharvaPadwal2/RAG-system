@@ -1,7 +1,15 @@
 <script setup>
-import { ref } from "vue";
+import { defineAsyncComponent, ref } from "vue";
 import { Chess } from "chess.js";
-import ChessBoard from "./components/ChessBoard.vue";
+import PlayChess from "./components/PlayChess.vue";
+const ChessBoard = defineAsyncComponent(() => import("./components/ChessBoard.vue"));
+
+const currentView = ref("play");
+const selectedMode = ref("medium");
+
+function syncMode(mode) {
+  selectedMode.value = mode;
+}
 
 const question = ref("");
 const messages = ref([]);
@@ -163,11 +171,84 @@ async function findGames() {
     gameLoading.value = false;
   }
 }
+const analysisLoading = ref(false);
+const analysisError = ref("");
+const analysisResult = ref(null);
+
+async function analyseBoard(board) {
+  if (analysisLoading.value) return;
+
+  analysisLoading.value = true;
+  analysisError.value = "";
+  analysisResult.value = null;
+
+  try {
+    const response = await fetch("http://127.0.0.1:8000/api/analyse", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fen: board.positions[board.step],
+      }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        response.status === 429
+          ? "Analysis limit reached. Please wait a minute."
+          : typeof data.detail === "string"
+            ? data.detail
+            : "Analysis failed."
+      );
+    }
+
+    analysisResult.value = data;
+  } catch (error) {
+    analysisError.value =
+      error instanceof TypeError
+        ? "Cannot reach the backend. Check that FastAPI is running."
+        : error.message || "Analysis failed.";
+  } finally {
+    analysisLoading.value = false;
+  }
+}
 </script>
 
 <template>
-  <main class="app">
-    <header>
+  <div class="site-shell">
+    <nav class="site-nav" aria-label="Main navigation">
+      <a class="site-brand" href="#home" @click.prevent="currentView = 'home'">
+        <span class="brand-mark" aria-hidden="true">♞</span>
+        <span>Chess<span class="brand-accent">RAG</span></span>
+      </a>
+      <div class="nav-links">
+        <button type="button" :class="{ selected: currentView === 'home' }" @click="currentView = 'home'">Home</button>
+        <button type="button" :class="{ selected: currentView === 'learn' }" @click="currentView = 'learn'">Learn Chess</button>
+        <button type="button" :class="{ selected: currentView === 'play' }" @click="currentView = 'play'">Play</button>
+      </div>
+    </nav>
+
+    <section v-if="currentView === 'home'" class="home-view" id="home">
+      <div class="home-copy">
+        <span class="home-eyebrow">A calmer way to get better</span>
+        <h1>Learn the board.<br /><em>Trust your next move.</em></h1>
+        <p>Explore ideas, replay classic lines, and put your instincts to work against Stockfish.</p>
+        <div class="home-actions">
+          <button type="button" class="home-primary" @click="currentView = 'play'">Play a game <span aria-hidden="true">→</span></button>
+          <button type="button" class="home-secondary" @click="currentView = 'learn'">Explore lessons</button>
+        </div>
+      </div>
+      <div class="home-board-art" aria-hidden="true">
+        <span class="home-piece home-piece-one">♞</span>
+        <span class="home-piece home-piece-two">♟</span>
+        <span class="home-orbit"></span>
+        <span class="home-caption">YOUR NEXT MOVE STARTS HERE</span>
+      </div>
+    </section>
+
+    <main v-else-if="currentView === 'learn'" class="app learn-view">
+      <header>
       <span class="badge">CHESS RAG</span>
       <h1>Understand your next move.</h1>
       <p>Ask about chess concepts and explore visual examples.</p>
@@ -372,6 +453,47 @@ async function findGames() {
       >
         Start
       </button>
+      <button
+  type="button"
+  :disabled="analysisLoading"
+  @click="analyseBoard(board)"
+>
+  {{ analysisLoading ? "Analysing…" : "Analyse position" }}
+</button>
+
+<p v-if="analysisError" class="error" role="alert">
+  {{ analysisError }}
+</p>
+
+<div
+  v-if="
+    analysisResult &&
+    analysisResult.fen === board.positions[board.step]
+  "
+>
+  <template v-if="analysisResult.status === 'game_over'">
+    <p>Game over: {{ analysisResult.result }}</p>
+  </template>
+
+  <template v-else>
+    <p>
+      <strong>Suggested move:</strong>
+      {{ analysisResult.best_move_san }}
+    </p>
+
+    <p v-if="analysisResult.mate_in !== null">
+      <strong>Mate score (White’s perspective):</strong>
+      {{ analysisResult.mate_in }}
+    </p>
+
+    <p v-else-if="analysisResult.score_cp !== null">
+      <strong>Evaluation (White’s perspective):</strong>
+      {{ (analysisResult.score_cp / 100).toFixed(2) }} pawns
+    </p>
+
+    <p><strong>Search depth:</strong> {{ analysisResult.depth }}</p>
+  </template>
+</div>
 
       <button
         type="button"
@@ -408,7 +530,15 @@ async function findGames() {
       Prototype: answers come from a small lesson collection and may contain errors.
       Each question is handled independently.
     </p>
-  </main>
+    </main>
+
+    <PlayChess
+      v-else-if="currentView === 'play'"
+      :mode="selectedMode"
+      @mode-change="syncMode"
+      @mode-rejected="syncMode"
+    />
+  </div>
 </template>
 
 <style scoped>
@@ -521,5 +651,68 @@ button:disabled {
     flex-direction: column;
     align-items: stretch;
   }
+}
+
+.site-shell { min-height: 100vh; color: #e8eee9; }
+.site-nav {
+  position: relative;
+  z-index: 20;
+  min-height: 62px;
+  padding: 0 clamp(14px, 3vw, 42px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid rgba(208, 226, 198, .1);
+  background: rgba(15, 25, 18, .96);
+}
+.site-brand { display: inline-flex; align-items: center; gap: 9px; color: #f1f3e9; text-decoration: none; font-size: 16px; font-weight: 800; letter-spacing: -.04em; }
+.brand-mark { display: grid; width: 31px; height: 31px; place-items: center; border-radius: 10px; background: #b9d39a; color: #172116; font-size: 19px; }
+.brand-accent { color: #b9d39a; }
+.nav-links { display: flex; align-items: center; gap: 5px; }
+.nav-links button { padding: 9px 13px; border: 0; border-radius: 8px; background: transparent; color: #a8b5a5; font-size: 12px; font-weight: 650; cursor: pointer; }
+.nav-links button:hover { background: rgba(185,211,154,.08); color: #f1f3e9; }
+.nav-links button.selected { background: #223528; color: #d7e5c7; }
+.site-nav button:focus-visible, .home-view button:focus-visible { outline: 2px solid #d8ef9b; outline-offset: 3px; }
+.app.learn-view { padding-top: 38px; }
+.home-view {
+  width: min(1320px, calc(100% - 40px));
+  min-height: calc(100dvh - 62px);
+  margin: 0 auto;
+  padding: clamp(42px, 8vw, 100px) 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(310px, .95fr);
+  align-items: center;
+  gap: clamp(32px, 8vw, 110px);
+}
+.home-copy { position: relative; z-index: 1; }
+.home-eyebrow { color: #b9d39a; font-size: 10px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+.home-copy h1 { margin: 18px 0; color: #f1f3e9; font-size: clamp(44px, 6.2vw, 78px); line-height: 1.03; letter-spacing: -.065em; }
+.home-copy h1 em { color: #b9d39a; font-family: Georgia, serif; font-weight: 500; }
+.home-copy > p { max-width: 450px; color: #a8b5a5; font-size: 15px; line-height: 1.75; }
+.home-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 28px; }
+.home-actions button { min-height: 46px; padding: 0 18px; border-radius: 10px; font: inherit; font-size: 12px; font-weight: 750; cursor: pointer; }
+.home-primary { border: 1px solid #b9d39a; background: #b9d39a; color: #172116; }
+.home-primary span { margin-left: 10px; font-size: 17px; }
+.home-secondary { border: 1px solid rgba(190,211,174,.2); background: transparent; color: #d9e1d4; }
+.home-board-art { position: relative; display: grid; place-items: center; width: min(100%, 490px); aspect-ratio: 1; justify-self: center; overflow: hidden; border: 1px solid rgba(190,211,174,.12); border-radius: 34px; background: radial-gradient(ellipse at 52% 48%, rgba(103,139,95,.24), transparent 58%), linear-gradient(145deg,#1b2d20,#101a13 75%); box-shadow: 0 30px 90px rgba(0,0,0,.25); }
+.home-board-art::before { content: ""; position: absolute; inset: 13%; border: 1px solid rgba(185,211,154,.22); border-radius: 50%; box-shadow: 0 0 0 32px rgba(185,211,154,.025), 0 0 0 68px rgba(185,211,154,.02); }
+.home-orbit { position: absolute; width: 82%; height: 38%; border: 1px solid rgba(216,231,193,.23); border-radius: 50%; transform: rotate(-34deg); }
+.home-piece { position: absolute; z-index: 1; line-height: 1; filter: drop-shadow(0 15px 13px rgba(0,0,0,.4)); }
+.home-piece-one { left: 25%; top: 18%; color: #e9eedf; font-size: clamp(110px, 17vw, 190px); transform: rotate(-12deg); }
+.home-piece-two { right: 18%; bottom: 16%; color: #91ab7e; font-size: clamp(90px, 13vw, 145px); transform: rotate(9deg); }
+.home-caption { position: absolute; right: 24px; bottom: 22px; color: #91a38a; font-size: 9px; font-weight: 700; letter-spacing: .18em; }
+@media (max-width: 760px) {
+  .home-view { min-height: calc(100dvh - 58px); grid-template-columns: 1fr; gap: 36px; padding-top: 48px; }
+  .home-board-art { width: min(100%, 410px); }
+}
+@media (max-width: 480px) {
+  .site-nav { min-height: 58px; gap: 8px; }
+  .site-brand { gap: 6px; font-size: 14px; }
+  .brand-mark { width: 28px; height: 28px; }
+  .nav-links { gap: 0; }
+  .nav-links button { padding: 8px 7px; font-size: 10px; }
+  .home-view { width: calc(100% - 28px); }
+  .home-copy h1 { font-size: clamp(40px, 11vw, 56px); }
 }
 </style>
