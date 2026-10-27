@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, ref, useId, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from "vue";
 import { Chess } from "chess.js";
 
 const props = defineProps({
@@ -13,9 +13,11 @@ const props = defineProps({
   lastMove: { type: [Object, Array], default: null },
   checkSquare: { type: String, default: "" },
   disabled: { type: Boolean, default: false },
+  premoveHighlights: { type: Array, default: () => [] },
+  premoveEnabled: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(["square-click", "move"]);
+const emit = defineEmits(["square-click", "move", "cancel-premove"]);
 const FILES = "abcdefgh";
 const PIECES = {
   w: { k: "♔", q: "♕", r: "♖", b: "♗", n: "♘", p: "♙", name: "White" },
@@ -60,7 +62,7 @@ const boardSquares = computed(() => {
         col,
         fileLabel: row === 7 ? FILES[fileIndex] : "",
         rankLabel: col === 0 ? String(rank) : "",
-        dark: (fileIndex + rank) % 2 === 0,
+        dark: (fileIndex + rank) % 2 === 1,
         label: `${piece ? `${PIECES[piece.color].name} ${piece.type === "n" ? "knight" : ({ k: "king", q: "queen", r: "rook", b: "bishop", p: "pawn" }[piece.type])}` : "Empty"} square ${square}`,
       });
     }
@@ -69,6 +71,7 @@ const boardSquares = computed(() => {
 });
 
 const highlightSet = computed(() => new Set(props.highlights));
+const premoveSet = computed(() => new Set(props.premoveHighlights));
 const targetSet = computed(() => new Set(props.legalTargets));
 const lastMoveSet = computed(() => {
   const move = props.lastMove;
@@ -227,8 +230,19 @@ function onSquareFocus(square) {
   keyboardSquare.value = square;
 }
 
+function onContextMenu(event) {
+  if (!props.premoveEnabled) return;
+  event.preventDefault();
+  emit("cancel-premove");
+}
+
 watch(inputBlocked, (blocked) => {
   if (blocked) clearGesture();
+});
+watch(() => [props.fen, props.flipped], () => clearGesture());
+onBeforeUnmount(() => {
+  clearTimeout(suppressClickTimer);
+  suppressClickTimer = null;
 });
 </script>
 
@@ -245,7 +259,7 @@ watch(inputBlocked, (blocked) => {
     @pointerup="onPointerUp"
     @pointercancel="onPointerCancel"
     @lostpointercapture="onPointerCancel"
-    @contextmenu.prevent
+    @contextmenu="onContextMenu"
   >
     <svg class="board-arrows" viewBox="0 0 8 8" aria-hidden="true">
       <defs>
@@ -276,6 +290,7 @@ watch(inputBlocked, (blocked) => {
         'is-last-move': lastMoveSet.has(cell.square),
         'is-selected': selectedSquare === cell.square,
         'is-check': checkSquare === cell.square,
+        'is-premove': premoveSet.has(cell.square),
         'is-drag-source': !!gesture?.dragging && gesture.from === cell.square,
         'is-legal-target': targetSet.has(cell.square),
         'has-piece-target': targetSet.has(cell.square) && !!cell.piece,
@@ -368,6 +383,7 @@ watch(inputBlocked, (blocked) => {
 .board-square.is-last-move::before { background: rgba(246, 200, 95, .34); }
 .board-square.is-selected::before { background: rgba(246, 200, 95, .56); box-shadow: inset 0 0 0 3px rgba(199, 144, 38, .72); }
 .board-square.is-check::before { background: rgba(221, 58, 54, .62); box-shadow: inset 0 0 0 3px rgba(255, 91, 83, .92); }
+.board-square.is-premove::before { background: rgba(88, 193, 164, .38); box-shadow: inset 0 0 0 3px rgba(54, 139, 119, .92); }
 .board-square:focus-visible { z-index: 3; outline: 3px solid #f5d76e; outline-offset: -4px; }
 .board-square:disabled { cursor: default; }
 .board-square.is-drag-source .chess-piece { opacity: .25; }
