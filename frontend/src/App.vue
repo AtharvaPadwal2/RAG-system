@@ -1,11 +1,41 @@
 <script setup>
 import { defineAsyncComponent, ref } from "vue";
 import { Chess } from "chess.js";
+import AuthPanel from "./components/AuthPanel.vue";
+import { useAuth } from "./composables/useAuth";
 import PlayChess from "./components/PlayChess.vue";
 const ChessBoard = defineAsyncComponent(() => import("./components/ChessBoard.vue"));
 
 const currentView = ref("play");
 const selectedMode = ref("medium");
+
+const showAuth = ref(false);
+const logoutBusy = ref(false);
+const accountError = ref("");
+
+const {
+  user,
+  isLoggedIn,
+  loading: authLoading,
+  authError,
+  signOut,
+} = useAuth();
+
+async function logout() {
+  if (logoutBusy.value) return;
+
+  logoutBusy.value = true;
+  accountError.value = "";
+
+  try {
+    await signOut();
+    showAuth.value = false;
+  } catch {
+    accountError.value = "Could not log out. Please try again.";
+  } finally {
+    logoutBusy.value = false;
+  }
+}
 
 function syncMode(mode) {
   selectedMode.value = mode;
@@ -215,9 +245,27 @@ async function analyseBoard(board) {
 }
 </script>
 
-<template>
+
+  <template>
   <div class="site-shell">
-    <nav class="site-nav" aria-label="Main navigation">
+    <div class="account-area">
+      <p
+        v-if="authError || accountError"
+        class="error"
+        role="alert"
+      >
+        {{ accountError || authError }}
+      </p>
+
+      <div
+        v-if="showAuth && !isLoggedIn"
+        id="account-panel"
+      >
+        <AuthPanel @close="showAuth = false" />
+      </div>
+    </div>
+
+        <nav class="site-nav" aria-label="Main navigation">
       <a class="site-brand" href="#home" @click.prevent="currentView = 'home'">
         <span class="brand-mark" aria-hidden="true">♞</span>
         <span>Chess<span class="brand-accent">RAG</span></span>
@@ -227,9 +275,36 @@ async function analyseBoard(board) {
         <button type="button" :class="{ selected: currentView === 'learn' }" @click="currentView = 'learn'">Learn Chess</button>
         <button type="button" :class="{ selected: currentView === 'play' }" @click="currentView = 'play'">Play</button>
       </div>
+      <div class="account-controls">
+  <span v-if="authLoading" role="status">
+    Checking login…
+  </span>
+
+  <template v-else-if="isLoggedIn">
+    <span class="account-email">{{ user.email }}</span>
+
+    <button
+      type="button"
+      :disabled="logoutBusy"
+      @click="logout"
+    >
+      {{ logoutBusy ? "Logging out…" : "Log out" }}
+    </button>
+  </template>
+
+  <button
+    v-else
+    type="button"
+    :aria-expanded="showAuth"
+    aria-controls="account-panel"
+    @click="showAuth = !showAuth"
+  >
+    {{ showAuth ? "Close login" : "Log in / Sign up" }}
+  </button>
+</div>
     </nav>
 
-    <section v-if="currentView === 'home'" class="home-view" id="home">
+    <section v-show="currentView === 'home'" class="home-view" id="home">
       <div class="home-copy">
         <span class="home-eyebrow">A calmer way to get better</span>
         <h1>Learn the board.<br /><em>Trust your next move.</em></h1>
@@ -247,12 +322,16 @@ async function analyseBoard(board) {
       </div>
     </section>
 
-    <main v-else-if="currentView === 'learn'" class="app learn-view">
+    <main v-show="currentView === 'learn'" class="app learn-view">
       <header>
       <span class="badge">CHESS RAG</span>
       <h1>Understand your next move.</h1>
       <p>Ask about chess concepts and explore visual examples.</p>
+      
+
+
     </header>
+    
 
     <form class="question-form" @submit.prevent="sendQuestion">
       <label for="question">Your chess question</label>
@@ -532,12 +611,12 @@ async function analyseBoard(board) {
     </p>
     </main>
 
-    <PlayChess
-      v-else-if="currentView === 'play'"
-      :mode="selectedMode"
-      @mode-change="syncMode"
-      @mode-rejected="syncMode"
-    />
+   <PlayChess
+  v-show="currentView === 'play'"
+  :mode="selectedMode"
+  @mode-change="syncMode"
+  @mode-rejected="syncMode"
+/>
   </div>
 </template>
 
@@ -714,5 +793,44 @@ button:disabled {
   .nav-links button { padding: 8px 7px; font-size: 10px; }
   .home-view { width: calc(100% - 28px); }
   .home-copy h1 { font-size: clamp(40px, 11vw, 56px); }
+}
+
+.account-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.account-email {
+  max-width: 100%;
+  color: #afc4a9;
+  overflow-wrap: anywhere;
+}
+
+.site-shell {
+  display: flex;
+  flex-direction: column;
+}
+
+.site-nav {
+  order: -1;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.account-controls {
+  margin-top: 0;
+}
+
+.account-area > .error {
+  padding: 0 20px;
+}
+
+.account-area:empty {
+  display: none;
 }
 </style>
