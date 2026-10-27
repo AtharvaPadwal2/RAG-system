@@ -12,8 +12,10 @@ const props = defineProps({
   interactive: { type: Boolean, default: false },
   disabled: { type: Boolean, default: false },
   checkSquare: { type: String, default: "" },
+  premoveHighlights: { type: Array, default: () => [] },
+  premoveEnabled: { type: Boolean, default: false },
 });
-const emit = defineEmits(["square-click"]);
+const emit = defineEmits(["square-click", "cancel-premove"]);
 
 const host = ref(null);
 const FILES = "abcdefgh";
@@ -62,6 +64,12 @@ function onBoardClick(event) {
   const row = Math.floor(local.z + 4);
   if (file < 0 || file > 7 || row < 0 || row > 7) return;
   emit("square-click", `${FILES[file]}${8 - row}`);
+}
+
+function onBoardContextMenu(event) {
+  if (!props.premoveEnabled) return;
+  event.preventDefault();
+  emit("cancel-premove");
 }
 
 /* ---------- procedural textures ---------- */
@@ -217,6 +225,7 @@ function init() {
   renderer.domElement.addEventListener("pointerdown", onBoardPointerDown);
   renderer.domElement.addEventListener("pointermove", onBoardPointerMove);
   renderer.domElement.addEventListener("click", onBoardClick);
+  renderer.domElement.addEventListener("contextmenu", onBoardContextMenu);
 
   scene = new THREE.Scene();
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -329,7 +338,10 @@ function init() {
 
   rebuild = () => {
     piecesGroup.clear();
-    fxGroup.children.forEach((o) => o.geometry && !o.userData.shared && o.geometry.dispose());
+    fxGroup.children.forEach((o) => {
+      if (!o.userData.shared) o.geometry?.dispose();
+      [].concat(o.material || []).forEach((material) => material?.dispose());
+    });
     fxGroup.clear();
     boardGroup.rotation.y = props.flipped ? Math.PI : 0;
 
@@ -356,6 +368,25 @@ function init() {
       m.rotation.x = -Math.PI / 2;
       m.position.set(x, 0.012, z);
       fxGroup.add(m);
+    });
+
+    props.premoveHighlights.forEach((name) => {
+      if (!/^[a-h][1-8]$/.test(name)) return;
+      const { x, z } = sqPos(name);
+      const premove = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.94, 0.94),
+        new THREE.MeshBasicMaterial({
+          color: 0x5ab59d,
+          transparent: true,
+          opacity: 0.48,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        }),
+      );
+      premove.userData.premove = true;
+      premove.rotation.x = -Math.PI / 2;
+      premove.position.set(x, 0.021, z);
+      fxGroup.add(premove);
     });
 
     if (/^[a-h][1-8]$/.test(props.checkSquare)) {
@@ -425,7 +456,7 @@ function init() {
 }
 
 onMounted(init);
-watch(() => [props.fen, props.highlights, props.arrows, props.flipped, props.checkSquare], () => rebuild(), { deep: true });
+watch(() => [props.fen, props.highlights, props.arrows, props.flipped, props.checkSquare, props.premoveHighlights], () => rebuild(), { deep: true });
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf);
@@ -439,6 +470,7 @@ onBeforeUnmount(() => {
   renderer?.domElement.removeEventListener("pointerdown", onBoardPointerDown);
   renderer?.domElement.removeEventListener("pointermove", onBoardPointerMove);
   renderer?.domElement.removeEventListener("click", onBoardClick);
+  renderer?.domElement.removeEventListener("contextmenu", onBoardContextMenu);
   renderer?.domElement.remove();
 });
 </script>
