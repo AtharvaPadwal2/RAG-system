@@ -240,7 +240,7 @@ class PlayResponse(BaseModel):
 
 
 @app.post("/api/play", response_model=PlayResponse)
-@limiter.limit("10/minute")
+@limiter.limit("100/minute")
 def play(request: Request, payload: PlayRequest):
     try:
         return play_stockfish(
