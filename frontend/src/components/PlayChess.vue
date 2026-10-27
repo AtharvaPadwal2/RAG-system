@@ -3,6 +3,7 @@ import {
   computed,
   defineAsyncComponent,
   nextTick,
+  onMounted,
   onBeforeUnmount,
   reactive,
   ref,
@@ -40,6 +41,14 @@ const MAX_BUSY_RETRIES = 2; // HTTP 503: at most 2 extra attempts
 const MAX_BUSY_WAIT_S = 10;
 const DEFAULT_COOLDOWN_S = 60; // HTTP 429 without Retry-After
 const UCI_RE = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
+const TIME_CONTROLS = [
+  { id: "untimed", label: "Untimed", baseMs: null, incrementMs: 0 },
+  { id: "1+0", label: "1+0 · 1 min", baseMs: 60_000, incrementMs: 0 },
+  { id: "3+2", label: "3+2 · 3 min", baseMs: 180_000, incrementMs: 2_000 },
+  { id: "5+0", label: "5+0 · 5 min", baseMs: 300_000, incrementMs: 0 },
+  { id: "10+0", label: "10+0 · 10 min", baseMs: 600_000, incrementMs: 0 },
+  { id: "15+10", label: "15+10 · 15 min", baseMs: 900_000, incrementMs: 10_000 },
+];
 
 const MODE_LABELS = {
   easy: "Easy",
@@ -72,6 +81,19 @@ const viewPly = ref(null); // null = live position, number = viewing history
 const selectedSquare = ref("");
 const legalTargets = ref([]);
 const pendingPromotion = ref(null);
+const timeControlId = ref("untimed");
+const clockState = reactive({ whiteMs: null, blackMs: null, runningSide: null, anchor: 0, turnStartedAt: 0 });
+const clockNow = ref(0);
+const clockSnapshots = ref([]);
+const clockPauseReason = ref("");
+const timeoutOutcome = ref(null);
+const timedGameStarted = ref(false);
+const premovesEnabled = ref(false);
+const queuedPremove = ref(null);
+const premoveSelection = ref("");
+const premoveNotice = ref("");
+let clockTimer = null;
+let clockListenersMounted = false;
 
 const showArrow = ref(true);
 const confirmState = ref(null);
@@ -94,11 +116,259 @@ function refresh() {
     viewPly.value = null;
   }
   clearSelection();
+  premoveSelection.value = "";
 }
 
 function clearSelection() {
   selectedSquare.value = "";
   legalTargets.value = [];
+}
+
+const oppositeSide = (side) => (side === "w" ? "b" : "w");
+const clockValue = (side) => (side === "w" ? clockState.whiteMs : clockState.blackMs);
+const setClockValue = (side, value) => {
+  if (side === "w") clockState.whiteMs = value;
+  else clockState.blackMs = value;
+};
+
+function clockRemainingAt(side, at = performance.now()) {
+  const value = clockValue(side);
+  if (value === null) return null;
+  if (clockState.runningSide !== side) return Math.max(0, value);
+  return Math.max(0, value - Math.max(0, at - clockState.anchor));
+}
+
+function snapshotClock(ply = game.history().length) {
+  if (isAnalysis.value || selectedTimeControl.value.baseMs === null) return;
+  const snapshot = {
+    ply,
+    whiteMs: clockState.whiteMs,
+    blackMs: clockState.blackMs,
+    runningSide: clockState.runningSide,
+  };
+  clockSnapshots.value = [
+    ...clockSnapshots.value.filter((item) => item.ply !== ply),
+    snapshot,
+  ].sort((a, b) => a.ply - b.ply);
+}
+
+function hasBareKing(side) {
+  const pieces = game.board().flat().filter((piece) => piece?.color === side);
+  return pieces.length === 1 && pieces[0].type === "k";
+}
+
+function clearQueuedPremove(notice = "") {
+  const hadPremove = !!queuedPremove.value || !!premoveSelection.value;
+  queuedPremove.value = null;
+  premoveSelection.value = "";
+  if (pendingPromotion.value?.kind === "premove") pendingPromotion.value = null;
+  if (notice && hadPremove) premoveNotice.value = notice;
+}
+
+function declareTimeout(flaggingSide, at = performance.now()) {
+  if (timeoutOutcome.value || isAnalysis.value || selectedTimeControl.value.baseMs === null) return;
+  setClockValue(flaggingSide, 0);
+  clockState.runningSide = null;
+  if (clockTimer) clearInterval(clockTimer);
+  clockTimer = null;
+  clockState.anchor = at;
+  clockNow.value = at;
+  clockPauseReason.value = "";
+  const winner = oppositeSide(flaggingSide);
+  const flaggingName = flaggingSide === "w" ? "White" : "Black";
+  // Practice policy only: draw if the non-flagging side has a bare king;
+  // otherwise award that side the win. This is not full FIDE mate-possibility adjudication.
+  if (hasBareKing(winner)) {
+    timeoutOutcome.value = {
+      result: "1/2-1/2",
+      text: `${flaggingName} ran out of time — draw (the other side has only a bare king)`,
+      kind: "timeout",
+    };
+  } else {
+    timeoutOutcome.value = {
+      result: winner === "w" ? "1-0" : "0-1",
+      text: `${flaggingName} ran out of time — ${winner === "w" ? "White" : "Black"} wins (simplified practice timeout rule)`,
+      kind: "timeout",
+    };
+  }
+  beginOperation();
+  engineBusy.value = false;
+  requestInFlight.value = false;
+  engineError.value = null;
+  pendingPromotion.value = null;
+  clearSelection();
+  clearQueuedPremove("Premove cleared: the game ended on time.");
+}
+
+function reconcileClockAt(at = performance.now()) {
+  clockNow.value = at;
+  if (isAnalysis.value || selectedTimeControl.value.baseMs === null || !clockState.runningSide || timeoutOutcome.value) return true;
+  const side = clockState.runningSide;
+  const remaining = clockRemainingAt(side, at);
+  if (remaining <= 0) {
+    declareTimeout(side, at);
+    return false;
+  }
+  setClockValue(side, remaining);
+  clockState.anchor = at;
+  return true;
+}
+
+function makeClockMovePlan(side, at = performance.now(), minimumElapsedMs = 0) {
+  if (timeoutOutcome.value || game.isGameOver()) return null;
+  if (selectedTimeControl.value.baseMs === null || isAnalysis.value) {
+    return { timed: false, side, at };
+  }
+  if (clockState.runningSide !== side || clockPauseReason.value) return null;
+  const remaining = clockValue(side);
+  const elapsedThisTurn = Math.max(0, at - clockState.turnStartedAt);
+  const elapsedSinceAnchor = Math.max(0, at - clockState.anchor);
+  const alreadyCharged = Math.max(0, elapsedThisTurn - elapsedSinceAnchor);
+  const chargeNow = Math.max(elapsedSinceAnchor, minimumElapsedMs - alreadyCharged);
+  const afterMove = remaining - chargeNow;
+  if (afterMove <= 0) {
+    declareTimeout(side, at);
+    return null;
+  }
+  return { timed: true, side, at, remaining: afterMove };
+}
+
+function commitClockMove(plan) {
+  const terminal = !!outcomeOf(game);
+  if (terminal) clearQueuedPremove("Premove cleared: the game is over.");
+  if (!plan?.timed) return;
+  setClockValue(plan.side, clockValue(plan.side) + selectedTimeControl.value.incrementMs);
+  clockState.runningSide = terminal ? null : game.turn();
+  clockState.anchor = plan.at;
+  clockState.turnStartedAt = plan.at;
+  clockPauseReason.value = "";
+  clockNow.value = plan.at;
+  snapshotClock(game.history().length);
+  if (terminal) {
+    if (clockTimer) clearInterval(clockTimer);
+    clockTimer = null;
+  }
+}
+
+function chargeClockBeforeMove(plan) {
+  if (!plan?.timed) return;
+  setClockValue(plan.side, plan.remaining);
+  clockState.anchor = plan.at;
+  clockNow.value = plan.at;
+}
+
+function restoreClockSnapshot(ply) {
+  if (selectedTimeControl.value.baseMs === null || isAnalysis.value) return;
+  const snapshot = clockSnapshots.value.find((item) => item.ply === ply);
+  if (!snapshot) return;
+  const now = performance.now();
+  clockState.whiteMs = snapshot.whiteMs;
+  clockState.blackMs = snapshot.blackMs;
+  clockState.runningSide = snapshot.runningSide;
+  clockState.anchor = now;
+  clockState.turnStartedAt = now;
+  clockNow.value = now;
+  clockPauseReason.value = "";
+  clockSnapshots.value = clockSnapshots.value.filter((item) => item.ply <= ply);
+  startClockTicker();
+}
+
+function resetClocks(mode = activeMode.value) {
+  const now = performance.now();
+  const base = mode === "analysis" ? null : selectedTimeControl.value.baseMs;
+  clockState.whiteMs = base;
+  clockState.blackMs = base;
+  clockState.runningSide = base === null ? null : "w";
+  clockState.anchor = now;
+  clockState.turnStartedAt = now;
+  clockNow.value = now;
+  clockSnapshots.value = [];
+  clockPauseReason.value = "";
+  timeoutOutcome.value = null;
+  snapshotClock(0);
+  startClockTicker();
+}
+
+function pauseClockForEngineFailure() {
+  if (selectedTimeControl.value.baseMs === null || !clockState.runningSide || timeoutOutcome.value) return;
+  if (!reconcileClockAt(performance.now())) return;
+  clockState.runningSide = null;
+  if (clockTimer) clearInterval(clockTimer);
+  clockTimer = null;
+  clockPauseReason.value = "Clock paused while Stockfish is unavailable. Retry resumes its clock.";
+}
+
+function resumeClockForEngineRetry() {
+  if (selectedTimeControl.value.baseMs === null || isAnalysis.value) return;
+  if (clockState.runningSide || !clockPauseReason.value) return;
+  const now = performance.now();
+  clockState.runningSide = game.turn();
+  clockState.anchor = now;
+  clockState.turnStartedAt = now;
+  clockNow.value = now;
+  clockPauseReason.value = "";
+  startClockTicker();
+}
+
+function startClockTicker() {
+  const shouldRun = !isAnalysis.value && selectedTimeControl.value.baseMs !== null;
+  if (!shouldRun) {
+    if (clockTimer) clearInterval(clockTimer);
+    clockTimer = null;
+    return;
+  }
+  if (clockTimer) return;
+  clockTimer = setInterval(() => reconcileClockAt(performance.now()), 100);
+}
+
+function onClockVisibilityChange() {
+  reconcileClockAt(performance.now());
+}
+
+function onPremoveKeydown(event) {
+  if (event.key !== "Escape") return;
+  if (confirmState.value) return;
+  if (pendingPromotion.value?.kind === "premove") {
+    event.preventDefault();
+    cancelPromotion();
+    premoveNotice.value = "Premove promotion cancelled.";
+    return;
+  }
+  if (!queuedPremove.value && !premoveSelection.value) return;
+  event.preventDefault();
+  cancelPremove();
+}
+
+watch(premovesEnabled, (enabled) => {
+  if (!enabled) clearQueuedPremove("Premove cleared: premoves were disabled.");
+});
+
+function formatClock(milliseconds) {
+  if (milliseconds === null || milliseconds === undefined) return "—";
+  const tenthsMode = milliseconds < 10_000;
+  const totalSeconds = Math.max(0, milliseconds) / 1000;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = Math.floor(totalSeconds % 60);
+  const base = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return tenthsMode ? `${base}.${Math.floor((milliseconds % 1000) / 100)}` : base;
+}
+
+function displayedClock(side) {
+  if (selectedTimeControl.value.baseMs === null || isAnalysis.value) return null;
+  if (!isLive.value) {
+    const snapshot = clockSnapshots.value.find((item) => item.ply === displayPly.value);
+    return snapshot ? (side === "w" ? snapshot.whiteMs : snapshot.blackMs) : clockValue(side);
+  }
+  return clockRemainingAt(side, clockNow.value || performance.now());
+}
+
+function clockIsRunning(side) {
+  return isLive.value && clockState.runningSide === side && !timeoutOutcome.value;
+}
+
+function clockIsLow(side) {
+  const remaining = displayedClock(side);
+  return remaining !== null && remaining <= 10_000;
 }
 
 /* ------------------------------------------------------------------ */
@@ -181,18 +451,33 @@ const displayFen = computed(() => {
 });
 const displayKey = computed(() => posKey(displayFen.value));
 
-const displayOutcome = computed(() => outcomeOf(displayChess.value));
 const liveOutcome = computed(() => {
   void liveFen.value;
   return outcomeOf(game);
 });
+const gameOutcome = computed(() => timeoutOutcome.value || liveOutcome.value);
+const displayOutcome = computed(() =>
+  isLive.value ? gameOutcome.value : outcomeOf(displayChess.value),
+);
 const liveResultTitle = computed(() => {
-  if (!liveOutcome.value) return "";
-  if (liveOutcome.value.result === "1/2-1/2") return "Draw";
+  const outcome = gameOutcome.value;
+  if (!outcome) return "";
+  if (outcome.result === "1/2-1/2") return "Draw";
   const humanWon =
-    (liveOutcome.value.result === "1-0" && humanColor.value === "w") ||
-    (liveOutcome.value.result === "0-1" && humanColor.value === "b");
+    (outcome.result === "1-0" && humanColor.value === "w") ||
+    (outcome.result === "0-1" && humanColor.value === "b");
   return humanWon ? "You win" : "Stockfish wins";
+});
+const selectedTimeControl = computed(
+  () => TIME_CONTROLS.find((preset) => preset.id === timeControlId.value) || TIME_CONTROLS[0],
+);
+const clockTopSide = computed(() => (flipped.value ? "w" : "b"));
+const clockBottomSide = computed(() => (flipped.value ? "b" : "w"));
+const premoveHighlights = computed(() => {
+  const squares = [];
+  if (premoveSelection.value) squares.push(premoveSelection.value);
+  if (queuedPremove.value) squares.push(queuedPremove.value.from, queuedPremove.value.to);
+  return [...new Set(squares)];
 });
 
 const displayInCheck = computed(() => displayChess.value.isCheck());
@@ -708,19 +993,33 @@ const needsEngineMove = computed(
   () =>
     isLive.value &&
     engineTurn.value &&
-    !liveOutcome.value &&
+    !gameOutcome.value &&
     !engineBusy.value &&
     !engineError.value &&
     !requestInFlight.value,
 );
 
 const canHumanMove = computed(() => {
-  if (!isLive.value || liveOutcome.value || confirmState.value) {
+  if (!isLive.value || gameOutcome.value || confirmState.value || clockPauseReason.value) {
     return false;
   }
   if (isAnalysis.value) return true;
   return !engineTurn.value && !engineBusy.value && !engineError.value;
 });
+
+const canQueuePremove = computed(
+  () =>
+    premovesEnabled.value &&
+    !isAnalysis.value &&
+    isLive.value &&
+    !gameOutcome.value &&
+    engineTurn.value &&
+    !confirmState.value &&
+    !pendingPromotion.value,
+);
+const canInteractWithBoard = computed(
+  () => (canHumanMove.value || canQueuePremove.value) && !pendingPromotion.value,
+);
 
 function selectPiece(square) {
   selectedSquare.value = square;
@@ -729,23 +1028,142 @@ function selectPiece(square) {
   ];
 }
 
-function onBoardMove({ from, to }) {
-  if (!canHumanMove.value || pendingPromotion.value) return;
-  const candidates = game
-    .moves({ square: from, verbose: true })
-    .filter((move) => move.to === to);
-  if (!candidates.length) return;
-  selectedSquare.value = from;
-  if (candidates.some((move) => move.promotion)) {
-    pendingPromotion.value = { from, to };
-    nextTick(() => promoQueenBtn.value?.focus());
+function requestPromotion(from, to, kind = "move") {
+  if (kind === "move" && !reconcileClockAt(performance.now())) return;
+  pendingPromotion.value = { from, to, kind };
+  nextTick(() => promoQueenBtn.value?.focus());
+}
+
+function isPlausiblePremove(from, to, promotion = null) {
+  if (!from || !to || from === to || !/^[a-h][1-8]$/.test(from) || !/^[a-h][1-8]$/.test(to)) return false;
+  const piece = game.get(from);
+  if (!piece || piece.color !== humanColor.value) return false;
+  const target = game.get(to);
+  if (target?.color === humanColor.value) return false;
+  const dx = to.charCodeAt(0) - from.charCodeAt(0);
+  const dy = Number(to[1]) - Number(from[1]);
+  const ax = Math.abs(dx), ay = Math.abs(dy);
+  let shape = false;
+  if (piece.type === "n") shape = (ax === 1 && ay === 2) || (ax === 2 && ay === 1);
+  else if (piece.type === "k") {
+    shape = Math.max(ax, ay) === 1;
+    const homeRank = humanColor.value === "w" ? "1" : "8";
+    if (from === `e${homeRank}` && to[1] === homeRank && dy === 0 && ax === 2) {
+      const kingSide = to[0] === "g";
+      const queenSide = to[0] === "c";
+      const right = humanColor.value === "w"
+        ? (kingSide ? "K" : queenSide ? "Q" : "")
+        : (kingSide ? "k" : queenSide ? "q" : "");
+      const rookSquare = `${kingSide ? "h" : "a"}${homeRank}`;
+      const path = kingSide
+        ? [`f${homeRank}`, `g${homeRank}`]
+        : [`d${homeRank}`, `c${homeRank}`, `b${homeRank}`];
+      shape = !!right && game.fen().split(" ")[2].includes(right) &&
+        game.get(rookSquare)?.type === "r" &&
+        game.get(rookSquare)?.color === humanColor.value &&
+        path.every((square) => !game.get(square));
+    }
+  }
+  else if (piece.type === "p") {
+    const direction = humanColor.value === "w" ? 1 : -1;
+    const startRank = humanColor.value === "w" ? "2" : "7";
+    const promotionRank = humanColor.value === "w" ? "8" : "1";
+    const reachesPromotion = to[1] === promotionRank;
+    const pathClear = (square) => !game.get(square);
+    if (dx === 0 && dy === direction && !target) shape = true;
+    else if (dx === 0 && dy === direction * 2 && from[1] === startRank && !target) {
+      const mid = `${from[0]}${Number(from[1]) + direction}`;
+      shape = pathClear(mid);
+    } else if (ax === 1 && dy === direction) shape = true;
+    if (reachesPromotion !== !!promotion) return false;
+    if (promotion && !["q", "r", "b", "n"].includes(promotion)) return false;
+    return shape;
+  } else {
+    const diagonal = ax === ay;
+    const straight = dx === 0 || dy === 0;
+    if (piece.type === "b") shape = diagonal;
+    else if (piece.type === "r") shape = straight;
+    else if (piece.type === "q") shape = diagonal || straight;
+    if (shape) {
+      const stepX = Math.sign(dx), stepY = Math.sign(dy);
+      for (let x = Number(from[0].charCodeAt(0)) + stepX, y = Number(from[1]) + stepY;
+        x !== to.charCodeAt(0) || y !== Number(to[1]);
+        x += stepX, y += stepY) {
+        const square = `${String.fromCharCode(x)}${y}`;
+        if (game.get(square)) { shape = false; break; }
+      }
+    }
+  }
+  return shape;
+}
+
+function queuePremove(from, to, promotion = null) {
+  if (!canQueuePremove.value || !isPlausiblePremove(from, to, promotion)) return false;
+  const replaced = !!queuedPremove.value;
+  queuedPremove.value = { from, to, promotion };
+  premoveSelection.value = "";
+  premoveNotice.value = `${replaced ? "Premove replaced" : "Premove queued"}: ${from}–${to}. It will be checked after Stockfish moves.`;
+  return true;
+}
+
+function handlePremoveSquare(square) {
+  if (!canQueuePremove.value) return;
+  if (!premoveSelection.value) {
+    const piece = game.get(square);
+    if (piece?.color === humanColor.value) premoveSelection.value = square;
     return;
   }
-  playHumanMove({ from, to });
+  const from = premoveSelection.value;
+  if (square === from) { premoveSelection.value = ""; return; }
+  if (game.get(square)?.color === humanColor.value) {
+    premoveSelection.value = square;
+    return;
+  }
+  const piece = game.get(from);
+  const finalRank = humanColor.value === "w" ? "8" : "1";
+  if (piece?.type === "p" && square[1] === finalRank) {
+    if (isPlausiblePremove(from, square, "q")) {
+      pendingPromotion.value = { from, to: square, kind: "premove" };
+      premoveSelection.value = "";
+      nextTick(() => promoQueenBtn.value?.focus());
+    }
+    return;
+  }
+  queuePremove(from, square);
+}
+
+function onBoardMove({ from, to }) {
+  if (pendingPromotion.value) return;
+  if (canHumanMove.value) {
+    const candidates = game
+      .moves({ square: from, verbose: true })
+      .filter((move) => move.to === to);
+    if (!candidates.length) return;
+    if (candidates.some((move) => move.promotion)) {
+      requestPromotion(from, to, "move");
+      return;
+    }
+    playHumanMove({ from, to });
+    return;
+  }
+  if (canQueuePremove.value) {
+    const piece = game.get(from);
+    const finalRank = humanColor.value === "w" ? "8" : "1";
+    if (piece?.color !== humanColor.value) return;
+    if (piece.type === "p" && to[1] === finalRank && isPlausiblePremove(from, to, "q")) {
+      pendingPromotion.value = { from, to, kind: "premove" };
+      nextTick(() => promoQueenBtn.value?.focus());
+    } else queuePremove(from, to);
+  }
 }
 
 function onSquareClick(square) {
-  if (!canHumanMove.value || pendingPromotion.value) return;
+  if (pendingPromotion.value) return;
+  if (canQueuePremove.value && !canHumanMove.value) {
+    handlePremoveSquare(square);
+    return;
+  }
+  if (!canHumanMove.value) return;
 
   if (square === selectedSquare.value) {
     clearSelection();
@@ -753,14 +1171,13 @@ function onSquareClick(square) {
   }
 
   if (selectedSquare.value) {
-    const candidates = game
+    const selectedMoves = game
       .moves({ square: selectedSquare.value, verbose: true })
       .filter((m) => m.to === square);
 
-    if (candidates.length) {
-      if (candidates.some((m) => m.promotion)) {
-        pendingPromotion.value = { from: selectedSquare.value, to: square };
-        nextTick(() => promoQueenBtn.value?.focus());
+    if (selectedMoves.length) {
+      if (selectedMoves.some((m) => m.promotion)) {
+        requestPromotion(selectedSquare.value, square, "move");
         return;
       }
       playHumanMove({ from: selectedSquare.value, to: square });
@@ -774,10 +1191,11 @@ function onSquareClick(square) {
 }
 
 function promote(piece) {
-  if (!pendingPromotion.value || !canHumanMove.value) return;
-  const { from, to } = pendingPromotion.value;
+  const pending = pendingPromotion.value;
+  if (!pending) return;
   pendingPromotion.value = null;
-  playHumanMove({ from, to, promotion: piece });
+  if (pending.kind === "premove") queuePremove(pending.from, pending.to, piece);
+  else if (canHumanMove.value) playHumanMove({ from: pending.from, to: pending.to, promotion: piece });
 }
 
 function cancelPromotion() {
@@ -785,8 +1203,26 @@ function cancelPromotion() {
   clearSelection();
 }
 
-function playHumanMove(input) {
+function cancelPremove() {
+  if (pendingPromotion.value?.kind === "premove") {
+    pendingPromotion.value = null;
+    premoveNotice.value = "Premove promotion cancelled.";
+    return;
+  }
+  if (!queuedPremove.value && !premoveSelection.value) return;
+  clearQueuedPremove();
+  premoveNotice.value = "Premove cancelled.";
+}
+
+function playHumanMove(input, { minimumElapsedMs = 0 } = {}) {
+  const moveAt = performance.now();
+  if (!isAnalysis.value) {
+    if (!canHumanMove.value || !reconcileClockAt(moveAt)) return;
+  }
+  const clockPlan = makeClockMovePlan(game.turn(), moveAt, minimumElapsedMs);
+  if (!clockPlan) return;
   let move;
+  chargeClockBeforeMove(clockPlan);
   try {
     move = game.move(input);
   } catch {
@@ -812,11 +1248,12 @@ function playHumanMove(input) {
     redoStack.value = [];
   }
 
+  commitClockMove(clockPlan);
   const gen = beginOperation();
   engineError.value = null;
   refresh();
 
-  if (liveOutcome.value) return; // result is decided locally
+  if (gameOutcome.value) return; // result is decided locally
 
   if (isAnalysis.value) {
     void evaluateFen(game.fen(), gen);
@@ -871,6 +1308,8 @@ if (
 function handleEngineError(err) {
   if (err instanceof StaleError) return;
   if (err instanceof ApiError) {
+    pauseClockForEngineFailure();
+    if (timeoutOutcome.value) return;
     if (err.kind === "rate") {
       startCooldown("play", err.retryAfter ?? DEFAULT_COOLDOWN_S);
     }
@@ -887,9 +1326,10 @@ async function runEngineFlow(gen) {
   if (gen !== opGen) return;
   engineError.value = null;
   engineBusy.value = true;
+  let committedEnginePosition = null;
 
   try {
-    if (liveOutcome.value || !engineTurn.value) return;
+    if (gameOutcome.value || !engineTurn.value) return;
 
 
     if (playRemaining.value > 0) {
@@ -911,9 +1351,16 @@ async function runEngineFlow(gen) {
       return;
     }
 
+    const moveAt = performance.now();
+    if (!reconcileClockAt(moveAt)) return;
+    const clockPlan = makeClockMovePlan(game.turn(), moveAt);
+    if (!clockPlan) return;
+    chargeClockBeforeMove(clockPlan);
     applyEngineData(data);
+    commitClockMove(clockPlan);
     refresh();
     engineBusy.value = false;
+    committedEnginePosition = { fen: game.fen(), ply: game.history().length };
   } catch (err) {
     handleEngineError(err);
     return;
@@ -921,9 +1368,47 @@ async function runEngineFlow(gen) {
     if (gen === opGen) engineBusy.value = false;
   }
 
-  if (gen === opGen && isAnalysis.value && !liveOutcome.value) {
+  if (gen === opGen && committedEnginePosition && queuedPremove.value && !gameOutcome.value) {
+    const { fen, ply } = committedEnginePosition;
+    setTimeout(() => executeQueuedPremove(gen, fen, ply), 0);
+  }
+
+  if (gen === opGen && isAnalysis.value && !gameOutcome.value) {
     await evaluateFen(game.fen(), gen);
   }
+}
+
+function executeQueuedPremove(expectedGen, expectedFen, expectedPly) {
+  const queued = queuedPremove.value;
+  queuedPremove.value = null;
+  premoveSelection.value = "";
+  if (!queued) return;
+  if (
+    expectedGen !== opGen ||
+    game.fen() !== expectedFen ||
+    game.history().length !== expectedPly ||
+    !isLive.value ||
+    gameOutcome.value ||
+    game.turn() !== humanColor.value
+  ) {
+    premoveNotice.value = "Premove discarded: the game position changed.";
+    return;
+  }
+  const legal = game.moves({ square: queued.from, verbose: true }).some(
+    (move) =>
+      move.from === queued.from &&
+      move.to === queued.to &&
+      (move.promotion || null) === (queued.promotion || null),
+  );
+  if (!legal) {
+    premoveNotice.value = "Premove discarded: that move isn’t legal in the resulting position.";
+    return;
+  }
+  premoveNotice.value = "Premove played.";
+  playHumanMove(
+    { from: queued.from, to: queued.to, ...(queued.promotion ? { promotion: queued.promotion } : {}) },
+    { minimumElapsedMs: 100 },
+  );
 }
 
 function retryEngine() {
@@ -936,8 +1421,9 @@ function retryEngine() {
     return;
   }
 
-  if (!engineTurn.value || liveOutcome.value) return;
+  if (!engineTurn.value || gameOutcome.value) return;
 
+  resumeClockForEngineRetry();
   const gen = beginOperation();
   void runEngineFlow(gen);
 }
@@ -958,8 +1444,14 @@ const engineErrorText = computed(() => {
 /* ------------------------------------------------------------------ */
 
 function undoMove() {
+  if (timeoutOutcome.value && !game.history().length) {
+    restoreLastCommittedPosition();
+    return;
+  }
   if (!game.history().length) return;
   beginOperation();
+  timeoutOutcome.value = null;
+  clearQueuedPremove("Premove cleared: Undo was used.");
   checkmateCelebration.value = false;
   checkmateAnimationReady.value = false;
   pendingPromotion.value = null;
@@ -967,7 +1459,7 @@ function undoMove() {
   evalError.value = null;
   viewPly.value = null;
 
-  if (isAnalysis.value) {
+  if (game.history().length && isAnalysis.value) {
     const undone = game.undo();
     if (undone) {
       redoStack.value = [
@@ -975,7 +1467,7 @@ function undoMove() {
         { from: undone.from, to: undone.to, promotion: undone.promotion },
       ];
     }
-  } else {
+  } else if (game.history().length) {
     const hist = game.history({ verbose: true });
     const last = hist[hist.length - 1];
     game.undo();
@@ -987,6 +1479,7 @@ function undoMove() {
     }
   }
 
+  restoreClockSnapshot(game.history().length);
   refresh();
 
   // Restore the cached evaluation (automatic via the cache); otherwise
@@ -1001,6 +1494,19 @@ function undoMove() {
     const gen = beginOperation();
     void evaluateFen(game.fen(), gen);
   }
+}
+
+function restoreLastCommittedPosition() {
+  if (!timeoutOutcome.value) return;
+  beginOperation();
+  timeoutOutcome.value = null;
+  engineError.value = null;
+  pendingPromotion.value = null;
+  clearQueuedPremove();
+  restoreClockSnapshot(game.history().length);
+  viewPly.value = null;
+  refresh();
+  premoveNotice.value = "Restored the last committed position and its clocks.";
 }
 
 function redoMove() {
@@ -1031,12 +1537,14 @@ function goToPly(ply) {
   viewPly.value = target === len ? null : target;
   pendingPromotion.value = null;
   clearSelection();
+  if (viewPly.value !== null) clearQueuedPremove("Premove cleared: viewing move history.");
 }
 
 function continueFromHere() {
   if (!isAnalysis.value || isLive.value) return;
   const target = viewPly.value;
   beginOperation();
+  clearQueuedPremove();
   while (game.history().length > target) game.undo();
   redoStack.value = [];
   viewPly.value = null;
@@ -1076,15 +1584,25 @@ const confirmYesBtn = ref(null);
 const promoQueenBtn = ref(null);
 
 const hasActiveGame = computed(
-  () => historyMoves.value.length > 0 && !liveOutcome.value,
+  () =>
+    historyMoves.value.length > 0 ||
+    (timedGameStarted.value && selectedTimeControl.value.baseMs !== null) ||
+    !!gameOutcome.value,
 );
 
-function resetGame({ mode = activeMode.value, color = humanColor.value } = {}) {
+function resetGame({ mode = activeMode.value, color = humanColor.value, timeControl = timeControlId.value } = {}) {
   beginOperation();
   checkmateCelebration.value = false;
   checkmateAnimationReady.value = false;
   activeMode.value = mode;
+  timeControlId.value = timeControl;
   humanColor.value = mode === "analysis" ? "w" : color;
+  timedGameStarted.value = mode !== "analysis" && timeControl !== "untimed";
+  clearQueuedPremove();
+  pendingPromotion.value = null;
+  timeoutOutcome.value = null;
+  premoveNotice.value = "";
+  resetClocks(mode);
   game.reset();
   redoStack.value = [];
   viewPly.value = null;
@@ -1123,6 +1641,29 @@ function requestNewGame() {
   }
 }
 
+function requestTimeControl(id) {
+  if (!TIME_CONTROLS.some((preset) => preset.id === id) || id === timeControlId.value) return;
+  if (hasActiveGame.value) {
+    const preset = TIME_CONTROLS.find((item) => item.id === id);
+    askConfirm({
+      kind: "time-control",
+      timeControl: id,
+      title: "Change the time control?",
+      text: `Changing to ${preset.label} starts a new game and discards the current one.`,
+      yes: "Change and start new game",
+      no: "Keep current game",
+    });
+  } else {
+    resetGame({ timeControl: id });
+  }
+}
+
+function onTimeControlChange(event) {
+  const requested = event.target.value;
+  event.target.value = timeControlId.value;
+  requestTimeControl(requested);
+}
+
 function requestColor(color) {
   if (color === humanColor.value) return;
   if (hasActiveGame.value) {
@@ -1145,6 +1686,7 @@ function acceptConfirm() {
   if (state.kind === "new") resetGame();
   else if (state.kind === "color") resetGame({ color: state.color });
   else if (state.kind === "mode") resetGame({ mode: state.mode });
+  else if (state.kind === "time-control") resetGame({ timeControl: state.timeControl });
 }
 
 function cancelConfirm() {
@@ -1181,8 +1723,8 @@ function flipBoard() {
 function setBoardType(type) {
   if (type === boardType.value) return;
   boardType.value = type;
-  pendingPromotion.value = null;
   clearSelection();
+  premoveSelection.value = "";
 }
 
 watch(liveFen, () => {
@@ -1201,7 +1743,7 @@ const sideName = (c) => (c === "w" ? "White" : "Black");
 
 const turnText = computed(() => {
   void liveFen.value;
-  if (liveOutcome.value) return liveOutcome.value.text;
+  if (gameOutcome.value) return gameOutcome.value.text;
   const check = game.isCheck() ? " — check!" : "";
   if (isAnalysis.value) return `${sideName(game.turn())} to move${check}`;
   if (engineBusy.value) return "Stockfish is thinking…";
@@ -1216,16 +1758,31 @@ const modeTitle = computed(() => (isAnalysis.value ? "Analysis board" : "Play ch
 /* Cleanup                                                             */
 /* ------------------------------------------------------------------ */
 
+onMounted(() => {
+  if (clockListenersMounted) return;
+  document.addEventListener("visibilitychange", onClockVisibilityChange);
+  window.addEventListener("focus", onClockVisibilityChange);
+  clockListenersMounted = true;
+  reconcileClockAt(performance.now());
+});
+
 onBeforeUnmount(() => {
   beginOperation();
   if (ticker) clearInterval(ticker);
   ticker = null;
+  if (clockTimer) clearInterval(clockTimer);
+  clockTimer = null;
+  if (clockListenersMounted) {
+    document.removeEventListener("visibilitychange", onClockVisibilityChange);
+    window.removeEventListener("focus", onClockVisibilityChange);
+    clockListenersMounted = false;
+  }
 });
 
 </script>
 
 <template>
-  <section class="play-chess">
+  <section class="play-chess" @keydown="onPremoveKeydown">
     <header class="play-header">
       <div>
         <span class="play-eyebrow">CHESS RAG · GAME ROOM</span>
@@ -1255,7 +1812,7 @@ onBeforeUnmount(() => {
       role="alertdialog"
       aria-labelledby="confirm-title"
       aria-describedby="confirm-text"
-      @keydown.esc="cancelConfirm"
+      @keydown.esc.stop="cancelConfirm"
     >
       <p id="confirm-title" class="confirm-title">{{ confirmState.title }}</p>
       <p id="confirm-text">{{ confirmState.text }}</p>
@@ -1295,9 +1852,11 @@ onBeforeUnmount(() => {
           <ChessBoard2D
             v-if="boardType === '2d'"
             :fen="displayFen"
-            :interactive="canHumanMove && !pendingPromotion"
+            :interactive="canInteractWithBoard"
             :disabled="!!confirmState"
             :highlights="boardHighlights"
+            :premove-highlights="premoveHighlights"
+            :premove-enabled="premovesEnabled && !isAnalysis"
             :arrows="boardArrows"
             :flipped="flipped"
             :selected-square="selectedSquare"
@@ -1306,17 +1865,21 @@ onBeforeUnmount(() => {
             :check-square="displayCheckSquare"
             @square-click="onSquareClick"
             @move="onBoardMove"
+            @cancel-premove="cancelPremove"
           />
           <ChessBoard
             v-else
             :fen="displayFen"
-            :interactive="canHumanMove && !pendingPromotion"
+            :interactive="canInteractWithBoard"
             :disabled="!!confirmState"
             :highlights="boardHighlights"
+            :premove-highlights="premoveHighlights"
+            :premove-enabled="premovesEnabled && !isAnalysis"
             :arrows="boardArrows"
             :flipped="flipped"
             :check-square="displayCheckSquare"
             @square-click="onSquareClick"
+            @cancel-premove="cancelPremove"
           />
         </div>
       </div>
@@ -1341,6 +1904,12 @@ onBeforeUnmount(() => {
               </select>
             </label>
           </div>
+          <label v-if="!isAnalysis" class="time-control-row">
+            <span>Time control</span>
+            <select :value="timeControlId" @change="onTimeControlChange">
+              <option v-for="preset in TIME_CONTROLS" :key="preset.id" :value="preset.id">{{ preset.label }}</option>
+            </select>
+          </label>
           <p class="turn" role="status" aria-live="polite" aria-atomic="true">
             <span
               v-if="engineBusy"
@@ -1350,15 +1919,43 @@ onBeforeUnmount(() => {
             {{ turnText }}
           </p>
 
+          <div v-if="!isAnalysis && selectedTimeControl.baseMs !== null" class="clocks" aria-label="Game clocks">
+            <div
+              v-for="side in [clockTopSide, clockBottomSide]"
+              :key="side"
+              class="clock-player"
+              :class="{ 'clock-player--running': clockIsRunning(side) }"
+            >
+              <span class="clock-player__identity">
+                <span class="clock-player__dot" :class="side === 'w' ? 'clock-player__dot--white' : 'clock-player__dot--black'" aria-hidden="true"></span>
+                {{ sideName(side) }} · {{ side === humanColor ? "You" : "Stockfish" }}
+              </span>
+              <span
+                class="clock-value"
+                :class="{ 'clock-value--active': clockIsRunning(side), 'clock-value--low': clockIsLow(side) }"
+                role="timer"
+                aria-live="off"
+              >{{ formatClock(displayedClock(side)) }}</span>
+              <span v-if="!isLive" class="clock-history-label">Historical</span>
+            </div>
+            <div class="clock-meta">
+              <span>{{ selectedTimeControl.label }}{{ selectedTimeControl.incrementMs ? ` · +${selectedTimeControl.incrementMs / 1000}s increment` : "" }}</span>
+              <span v-if="clockPauseReason" class="clock-paused">Paused</span>
+              <span v-else-if="gameOutcome" class="clock-paused">Final</span>
+            </div>
+          </div>
+          <p v-if="clockPauseReason" class="clock-pause-note" role="status">{{ clockPauseReason }}</p>
+
           <p v-if="!isLive" class="banner">
             Viewing earlier position (after move {{ displayPly }} of
             {{ historyMoves.length }}). Moves are disabled until you return to
             the latest position.
           </p>
 
-          <p v-if="isLive && !isAnalysis && liveOutcome" class="result-note">
+          <p v-if="isLive && !isAnalysis && gameOutcome" class="result-note">
             <strong>{{ liveResultTitle }}</strong>
-            <span>{{ liveOutcome.text }} · {{ historyMoves.length }} half-moves</span>
+            <span>{{ gameOutcome.text }} · {{ historyMoves.length }} half-moves</span>
+            <button v-if="timeoutOutcome" type="button" class="btn secondary small" @click="restoreLastCommittedPosition">Restore last position</button>
             <button type="button" class="btn secondary small" @click="goToPly(0)">Review game</button>
           </p>
 
@@ -1366,7 +1963,7 @@ onBeforeUnmount(() => {
             {{ engineErrorText }}
           </p>
 
-          <p v-if="isLive && !liveOutcome && canHumanMove" class="subtle small">
+          <p v-if="isLive && !gameOutcome && canHumanMove" class="subtle small">
             Select a piece and destination, or drag to move. Use the board switch above for 2D or 3D.
           </p>
         </div>
@@ -1377,9 +1974,9 @@ onBeforeUnmount(() => {
           class="card promotion-picker"
           role="group"
           aria-label="Choose a promotion piece"
-          @keydown.esc="cancelPromotion"
+          @keydown.esc.stop="cancelPromotion"
         >
-          <p>Promote pawn to:</p>
+          <p>{{ pendingPromotion.kind === "premove" ? "Choose premove promotion:" : "Promote pawn to:" }}</p>
           <div class="row">
             <button
               ref="promoQueenBtn"
@@ -1542,6 +2139,25 @@ onBeforeUnmount(() => {
         <!-- Controls -->
         <div class="card controls-card">
           <h3>Controls</h3>
+
+          <label v-if="!isAnalysis" class="checkbox premove-toggle">
+            <input v-model="premovesEnabled" type="checkbox" />
+            Enable premoves while Stockfish thinks
+          </label>
+          <div v-if="!isAnalysis && premovesEnabled" class="premove-tools">
+            <p v-if="queuedPremove" class="premove-status" role="status">
+              Premove queued: <strong>{{ queuedPremove.from }} → {{ queuedPremove.to }}</strong>
+              <span>This is an intention, not a guaranteed legal move.</span>
+            </p>
+            <p v-else-if="premoveSelection" class="premove-status" role="status">Premove source selected. Choose a destination.</p>
+            <p v-else-if="premoveNotice" class="premove-feedback" role="status">{{ premoveNotice }}</p>
+            <button
+              v-if="queuedPremove || premoveSelection || pendingPromotion?.kind === 'premove'"
+              type="button"
+              class="btn secondary small"
+              @click="pendingPromotion?.kind === 'premove' ? cancelPromotion() : cancelPremove()"
+            >Cancel premove</button>
+          </div>
 
           <div v-if="!isAnalysis" class="color-pick">
             <span id="color-label" class="subtle small">Play as</span>
@@ -2007,7 +2623,7 @@ p {
 }
 .board-area { justify-content: center; align-items: center; min-width: 0; }
 .board-wrap {
-  width: min(100%, calc(100dvh - 235px), calc((100vw - 430px) * .92));
+  width: min(100%, calc(100dvh - 275px), calc((100vw - 430px) * .92));
   max-width: 900px;
   aspect-ratio: 1;
   flex: 0 1 auto;
@@ -2022,6 +2638,28 @@ p {
 .side-panel .moves-card { order: 3; }
 .side-panel .eval-card { order: 4; }
 .status-card .turn { margin-top: 12px; font-size: 15px; }
+.time-control-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 0 2px; color: var(--muted); font-size: 11px; }
+.time-control-row select { min-width: 124px; padding: 7px 27px 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: #122017; color: var(--text); font: inherit; font-size: 11px; }
+.clocks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 12px 0 4px; }
+.clock-player { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px; min-width: 0; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; background: #111c15; }
+.clock-player--running { border-color: rgba(185,211,154,.68); background: linear-gradient(125deg, rgba(185,211,154,.12), #111c15 72%); box-shadow: inset 0 0 0 1px rgba(185,211,154,.08); }
+.clock-player__identity { display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--muted); font-size: 11px; font-weight: 650; }
+.clock-player__dot { flex: 0 0 10px; width: 10px; height: 10px; border: 1px solid rgba(255,255,255,.36); border-radius: 50%; }
+.clock-player__dot--white { background: #f1ead6; box-shadow: inset 0 0 0 2px #fff; }
+.clock-player__dot--black { background: #26382b; }
+.clock-value { color: #edf0e2; font-size: clamp(18px, 2vw, 22px); font-variant-numeric: tabular-nums; font-weight: 750; letter-spacing: .015em; white-space: nowrap; }
+.clock-value--active { color: #d7edc0; }
+.clock-value--low { color: #ffb387; }
+.clock-meta { display: flex; grid-column: 1 / -1; justify-content: space-between; gap: 8px; padding: 0 2px; color: var(--muted); font-size: 10px; }
+.clock-paused { color: #ffce93; font-weight: 750; text-transform: uppercase; letter-spacing: .08em; }
+.clock-history-label { grid-column: 1 / -1; color: #c8af77; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; }
+.clock-pause-note { margin: 5px 0 0; padding: 8px 10px; border: 1px solid rgba(255,206,147,.22); border-radius: 8px; background: rgba(255,206,147,.06); color: #f0ca9d; font-size: 11px; line-height: 1.45; }
+.premove-toggle { margin: 2px 0 10px; color: var(--text); font-size: 12px; }
+.premove-tools { margin: 0 0 10px; padding: 9px 10px; border: 1px solid rgba(90,181,157,.24); border-radius: 9px; background: rgba(90,181,157,.07); }
+.premove-status { margin: 0; color: #c4e5d7; font-size: 11px; font-weight: 700; line-height: 1.45; }
+.premove-status span { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; font-weight: 500; }
+.premove-feedback { margin: 0; color: var(--muted); font-size: 11px; }
+.premove-tools .btn { margin-top: 8px; }
 .opponent-row { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
 .opponent-piece { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 11px; background: #2b4431; color: #e8eedc; font-size: 23px; }
 .opponent-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
